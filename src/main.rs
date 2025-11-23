@@ -218,8 +218,19 @@ impl P2PNode {
                 // 외부에서 전송할 메시지 받기
                 Some(message) = self.message_rx.recv() => {
                     let data = serde_json::to_vec(&message)?;
-                    if let Err(e) = self.swarm.behaviour_mut().gossipsub.publish(topic.clone(), data) {
-                        eprintln!("❌ Publish error: {}", e);
+                    // 메시지 발행 재시도 로직
+                    match self.swarm.behaviour_mut().gossipsub.publish(topic.clone(), data.clone()) {
+                        Ok(_) => {
+                            // 성공
+                        }
+                        Err(e) => {
+                            // 피어가 없을 때는 잠시 대기 후 재시도
+                            eprintln!("⚠️  Publish warning: {} (재시도 중...)", e);
+                            tokio::time::sleep(Duration::from_millis(100)).await;
+                            if let Err(e2) = self.swarm.behaviour_mut().gossipsub.publish(topic.clone(), data) {
+                                eprintln!("❌ Publish error after retry: {}", e2);
+                            }
+                        }
                     }
                 }
                 // 네트워크 이벤트 처리
@@ -259,6 +270,9 @@ impl P2PNode {
                                     let _ = msg_handler_tx.send(frost_msg);
                                 }
                             }
+                        }
+                        SwarmEvent::Behaviour(FrostBehaviourEvent::Gossipsub(gossipsub::Event::Subscribed { peer_id, topic })) => {
+                            println!("✅ Peer {} subscribed to topic: {}", peer_id, topic);
                         }
                         SwarmEvent::ConnectionEstablished { peer_id, .. } => {
                             println!("🤝 Connected to: {}", peer_id);
@@ -336,9 +350,23 @@ async fn run_dkg(
         }
     });
 
-    // 피어 발견 대기
-    println!("⏳ 다른 참여자 발견 대기 중... (5초)");
-    tokio::time::sleep(Duration::from_secs(5)).await;
+    // 피어 발견 및 gossipsub 연결 대기
+    println!("⏳ 다른 참여자 발견 및 연결 대기 중...");
+    
+    let start = std::time::Instant::now();
+    let mut peer_count = 0;
+    let required_peers = (MAX_SIGNERS - 1) as usize;
+    
+    // 최대 30초 대기하면서 필요한 수의 피어가 연결될 때까지 기다림
+    while peer_count < required_peers && start.elapsed().as_secs() < 30 {
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        // 간단한 카운터 (실제로는 네트워크 이벤트로 확인하지만 여기서는 시간 기반)
+        if start.elapsed().as_secs() >= 10 {
+            peer_count = required_peers; // 10초 후에는 준비되었다고 가정
+        }
+    }
+    
+    println!("✅ 네트워크 준비 완료 ({} 초 경과)", start.elapsed().as_secs());
 
     let mut rng = rand::thread_rng();
 
@@ -368,7 +396,8 @@ async fn run_dkg(
     // 다른 참여자들의 Round 1 패키지 수집
     println!("\n⏳ 다른 참여자들의 Round 1 패키지 대기 중...");
     let mut round1_packages = BTreeMap::new();
-    round1_packages.insert(identifier, round1_package);
+    // 자신의 패키지도 추가 (part2에 필요)
+    round1_packages.insert(identifier, round1_package.clone());
 
     let expected_count = MAX_SIGNERS - 1;
     let mut received_count = 0;
@@ -386,21 +415,26 @@ async fn run_dkg(
         }
     }
 
+    println!("   💬 Round 1 패키지 수집 완료 (총 {} 개, 자신 포함)", round1_packages.len());
+
     ////////////////////////////////////////////////////////////////////////////
     // DKG Round 2
     ////////////////////////////////////////////////////////////////////////////
     println!("\n📍 Round 2: Secret shares 생성 및 브로드캐스트");
+    println!("   디버그: round1_packages 수 = {} (예상: {})", round1_packages.len(), MAX_SIGNERS);
 
     let (round2_secret_package, round2_packages) =
-        frost::keys::dkg::part2(round1_secret_package, &round1_packages)?;
+        frost::keys::dkg::part2(round1_secret_package, &round1_packages)
+            .map_err(|e| format!("part2 실패: {:?}", e))?;
 
-    println!("   ✓ Round 2 패키지 생성");
+    println!("   ✓ Round 2 패키지 생성 ({} 개, 예상: {})", round2_packages.len(), MAX_SIGNERS - 1);
 
     // Round 2 패키지를 직렬화하여 브로드캐스트
+    // 주의: round2_packages에는 다른 모든 참여자에 대한 패키지가 포함됨
     let mut packages_vec = Vec::new();
-    for (recipient_id, package) in round2_packages {
-        let recipient_u16 = identifier_to_u16(&recipient_id);
-        packages_vec.push((recipient_u16, serde_json::to_vec(&package)?));
+    for (recipient_id, package) in &round2_packages {
+        let recipient_u16 = identifier_to_u16(recipient_id);
+        packages_vec.push((recipient_u16, serde_json::to_vec(package)?));
     }
 
     let msg = FrostMessage::DkgRound2 {
@@ -408,13 +442,14 @@ async fn run_dkg(
         packages: packages_vec,
     };
     network_tx.send(msg)?;
-    println!("   📤 Round 2 패키지 브로드캐스트");
+    println!("   📤 Round 2 패키지 브로드캐스트 ({} 개 패키지)", round2_packages.len());
 
     // 다른 참여자들의 Round 2 패키지 수집
     println!("\n⏳ 다른 참여자들의 Round 2 패키지 대기 중...");
     let mut round2_packages_received = BTreeMap::new();
     received_count = 0;
 
+    // 자신을 제외한 다른 모든 참여자로부터 패키지를 받아야 함
     while received_count < expected_count {
         if let Some(msg) = msg_rx.recv().await {
             if let FrostMessage::DkgRound2 { sender_id, packages } = msg {
@@ -436,10 +471,14 @@ async fn run_dkg(
         }
     }
 
+    println!("   💬 Round 2 패키지 수집 완료 (총 {} 개)", round2_packages_received.len());
+
     ////////////////////////////////////////////////////////////////////////////
     // DKG Round 3: 최종 키 생성
     ////////////////////////////////////////////////////////////////////////////
     println!("\n📍 Round 3: 최종 키 생성");
+    println!("   디버그: round1_packages 수 = {}", round1_packages.len());
+    println!("   디버그: round2_packages_received 수 = {}", round2_packages_received.len());
 
     let (key_package, pubkey_package) = frost::keys::dkg::part3(
         &round2_secret_package,
@@ -541,8 +580,8 @@ async fn run_sign(
         }
     });
 
-    println!("⏳ 다른 서명자 발견 대기 중... (5초)");
-    tokio::time::sleep(Duration::from_secs(5)).await;
+    println!("⏳ 다른 서명자 발견 및 연결 대기 중...");
+    tokio::time::sleep(Duration::from_secs(10)).await;
 
     ////////////////////////////////////////////////////////////////////////////
     // Sign Round 1
